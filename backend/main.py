@@ -26,8 +26,11 @@ app.add_middleware(
 BASE_DIR = Path(__file__).resolve().parent
 FRONTEND_DIR = BASE_DIR.parent / "frontend"
 G_walk = None  # global walking graph
+G_bike = None  # global bike graph
 CACHE_PATH = BASE_DIR / "data" / "munich_walk.graphml"
+CACHE_PATH_BIKE = BASE_DIR / "data" / "munich_bike.graphml"
 CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+CACHE_PATH_BIKE.parent.mkdir(parents=True, exist_ok=True)
 STATIC_DATA_DIR = BASE_DIR / "static_data"
 STATIC_DATA_DIR.mkdir(parents=True, exist_ok=True)
 NODE_CACHE = {}
@@ -51,6 +54,11 @@ CRIME_INFLUENCE_RADIUS = 220.0
 CRIME_SIGMA = 95.0
 CRIME_DENSITY_NORMALIZER = 3.4
 CRIME_NEAR_DECAY = 140.0
+BIKE_CRASH_SIGMA = 140.0
+BIKE_CRASH_INFLUENCE_RADIUS = 260.0
+TRAFFIC_SIGMA = 180.0
+BIKE_CRASH_DATA_PATH = STATIC_DATA_DIR / "munich_bike_crashes.json"
+TRAFFIC_DATA_PATH = STATIC_DATA_DIR / "munich_traffic_hotspots.json"
 SAFE_POI_TAGS = {
     "amenity": ["police", "fire_station", "ranger_station", "embassy", "hospital", "clinic"],
     "emergency": ["ambulance_station"],
@@ -124,6 +132,49 @@ MODE_CONFIG = {
         "lighting_decay": 150.0,
         "crime_gap_decay": 200.0,
     },
+    "bike_fast": {
+        "length_bias": 1.0,
+        "min_factor": 0.6,
+        "bike_lane_reward": 0.8,
+        "traffic_penalty": 1.6,
+        "non_bike_penalty": 50.0,
+        "lit_penalty": 0.1,
+    },
+    "bike_safe": {
+        "length_bias": 1.05,
+        "min_factor": 0.45,
+        "bike_lane_reward": 0.9,
+        "crash_penalty": 3.2,
+        "traffic_penalty": 2.4,
+        "safe_score_reward": 1.6,
+        "safe_anchor_reward": 1.2,
+        "busy_reward": 0.8,
+        "lighting_reward": 0.9,
+        "non_bike_penalty": 60.0,
+        "unsafe_penalty": 1.2,
+        "crime_density_penalty": 1.8,
+        "bad_area_penalty": 2.2,
+        "crime_near_penalty": 1.4,
+        "crime_gap_reward": 0.8,
+        "safe_decay": 110.0,
+        "busy_decay": 160.0,
+        "lighting_decay": 150.0,
+        "crime_gap_decay": 200.0,
+        "unsafe_floor": 0.35,
+        "unsafe_multiplier": 2.8,
+    },
+    "bike_scenic": {
+        "length_bias": 0.8,
+        "scenic_reward": 1.6,
+        "water_reward": 2.0,
+        "green_reward": 1.3,
+        "detour_penalty": 0.08,
+        "min_factor": 0.08,
+        "water_decay": 150.0,
+        "green_decay": 300.0,
+        "bike_lane_reward": 0.7,
+        "non_bike_penalty": 40.0,
+    },
 }
 
 # Backwards-compatible aliases for earlier beta modes
@@ -134,11 +185,17 @@ MODE_DISPLAY_NAME = {
     "fast": "Direct",
     "safe": "Night Safe",
     "scenic": "Scenic",
+    "bike_fast": "Bike Direct",
+    "bike_safe": "Ride Safe",
+    "bike_scenic": "Bike Scenic",
 }
 MODE_SPEED_MPS = {
     "fast": 1.5,
     "safe": 1.35,
     "scenic": 1.3,
+    "bike_fast": 4.8,
+    "bike_safe": 4.4,
+    "bike_scenic": 4.2,
 }
 DEFAULT_SPEED_MPS = 1.35
 GREEN_PROX_THRESHOLD = 80.0
@@ -275,6 +332,60 @@ def load_crime_points(target_crs):
     tree = STRtree(geoms)
     geom_weights = {id(geom): weight for geom, weight in zip(geoms, weights)}
     return {"tree": tree, "geoms": geoms, "weights": geom_weights}
+
+
+def load_point_dataset(path: Path, target_crs):
+    if not path.exists():
+        return []
+    try:
+        entries = json.loads(path.read_text())
+    except Exception as exc:
+        print(f"Warning: failed to parse {path.name}: {exc}")
+        return []
+    geoms = []
+    transformer = Transformer.from_crs("EPSG:4326", target_crs, always_xy=True)
+    for entry in entries:
+        try:
+            lon = float(entry.get("lng") or entry.get("lon") or entry.get("longitude"))
+            lat = float(entry.get("lat") or entry.get("latitude"))
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if not math.isfinite(lon) or not math.isfinite(lat):
+            continue
+        x, y = transformer.transform(lon, lat)
+        geoms.append(Point(x, y))
+    return geoms
+
+
+def mock_points_from_bounds(graph_proj: nx.MultiDiGraph, count: int):
+    xs = [data["x"] for _, data in graph_proj.nodes(data=True)]
+    ys = [data["y"] for _, data in graph_proj.nodes(data=True)]
+    if not xs or not ys:
+        return []
+    minx, maxx = min(xs), max(xs)
+    miny, maxy = min(ys), max(ys)
+    geoms = []
+    for _ in range(count):
+        x = random.uniform(minx, maxx)
+        y = random.uniform(miny, maxy)
+        geoms.append(Point(x, y))
+    return geoms
+
+
+def build_point_tree(geoms, weights=None):
+    if not geoms:
+        return None
+    weights = weights or [1.0 for _ in geoms]
+    return {"tree": STRtree(geoms), "geoms": geoms, "weights": {id(g): w for g, w in zip(geoms, weights)}}
+
+
+def load_or_mock_points(path: Path, graph_proj: nx.MultiDiGraph, target_crs, mock_count: int):
+    geoms = load_point_dataset(path, target_crs)
+    if not geoms:
+        print(f"Using mock points for {path.name} (count={mock_count})")
+        geoms = mock_points_from_bounds(graph_proj, mock_count)
+    weights = [random.uniform(0.5, 1.4) for _ in geoms]
+    return build_point_tree(geoms, weights)
 
 
 def compute_scenic_score(edge_attrs):
@@ -439,6 +550,16 @@ def is_bike_friendly(attrs):
     return bicycle in {"designated", "yes"}
 
 
+def is_bike_accessible(attrs):
+    bicycle = str(attrs.get("bicycle", "")).lower()
+    highway = str(attrs.get("highway", "")).lower()
+    if bicycle == "no":
+        return False
+    if highway in {"footway", "pedestrian", "steps"} and bicycle not in {"designated", "yes"}:
+        return False
+    return True
+
+
 def init_segment_stats():
     return {
         "length": 0.0,
@@ -544,10 +665,15 @@ def make_weight_function(mode_name: str, mode_config: dict):
         return math.exp(-dist_value / decay)
 
     def weight_for_attrs(attrs: dict) -> float:
+        is_bike_mode = mode_name.startswith("bike_")
+        base_mode = mode_name[5:] if is_bike_mode else mode_name
         length = float(attrs.get("length", 1.0))
         scenic = max(0.0, min(1.0, float(attrs.get("scenic_score", 0.5))))
 
-        if mode_name == "fast":
+        if is_bike_mode and not is_bike_accessible(attrs):
+            return length * mode_config.get("non_bike_penalty", 80.0)
+
+        if base_mode == "fast":
             safe = max(0.0, min(1.0, float(attrs.get("safe_score", 0.3))))
             avoid = mode_config.get("length_bias", 1.0)
             avoid += mode_config.get("scenic_avoid", 0.0) * scenic
@@ -564,9 +690,15 @@ def make_weight_function(mode_name: str, mode_config: dict):
             elif lit_value in LIT_NEGATIVE:
                 avoid = max(0.1, avoid - mode_config.get("dark_reward", 0.0))
 
+            if is_bike_mode:
+                if is_bike_friendly(attrs):
+                    avoid = max(0.05, avoid - mode_config.get("bike_lane_reward", 0.0))
+                traffic_risk = max(0.0, float(attrs.get("traffic_risk", 0.0)))
+                avoid += traffic_risk * mode_config.get("traffic_penalty", 0.0)
+
             return length * max(mode_config.get("min_factor", 0.5), avoid)
 
-        if mode_name == "safe":
+        if base_mode == "safe":
             safe_score = max(0.0, min(1.0, float(attrs.get("safe_score", 0.3))))
             dist_safe = as_float(attrs.get("dist_safe_poi", DEFAULT_DIST), DEFAULT_DIST)
             dist_busy = as_float(attrs.get("dist_busy_area", DEFAULT_DIST), DEFAULT_DIST)
@@ -574,6 +706,8 @@ def make_weight_function(mode_name: str, mode_config: dict):
             dist_crime = as_float(attrs.get("dist_crime_hotspot", DEFAULT_DIST), DEFAULT_DIST)
             crime_density = max(0.0, min(1.0, float(attrs.get("crime_density", 0.0))))
             bad_area = max(0.0, min(1.0, float(attrs.get("bad_area_score", 0.0))))
+            crash_risk = max(0.0, min(1.0, float(attrs.get("bike_crash_risk", 0.0))))
+            traffic_risk = max(0.0, min(1.0, float(attrs.get("traffic_risk", 0.0))))
 
             safe_aff = affinity(dist_safe, mode_config["safe_decay"])
             busy_aff = affinity(dist_busy, mode_config["busy_decay"])
@@ -591,6 +725,12 @@ def make_weight_function(mode_name: str, mode_config: dict):
             penalty += mode_config["crime_density_penalty"] * crime_density
             penalty += mode_config["bad_area_penalty"] * bad_area
             penalty += mode_config["crime_near_penalty"] * crime_aff
+
+            if is_bike_mode:
+                penalty += mode_config.get("crash_penalty", 0.0) * crash_risk
+                penalty += mode_config.get("traffic_penalty", 0.0) * traffic_risk
+                if is_bike_friendly(attrs):
+                    reward += mode_config.get("bike_lane_reward", 0.0)
 
             weight = length * (mode_config["length_bias"] + penalty)
             if reward > 0:
@@ -616,6 +756,11 @@ def make_weight_function(mode_name: str, mode_config: dict):
         weight = length * (mode_config.get("length_bias", 1.0) + penalty)
         if reward > 0:
             weight /= 1 + reward
+        if is_bike_mode:
+            if is_bike_friendly(attrs):
+                weight /= 1 + mode_config.get("bike_lane_reward", 0.0)
+            else:
+                weight *= mode_config.get("non_bike_penalty", 40.0)
         min_weight = length * mode_config.get("min_factor", 0.1)
         return max(min_weight, weight)
 
@@ -701,6 +846,26 @@ def compute_comparison_ratios(current_stats, baseline_stats):
             continue
         ratios[key] = (cur - base) / base
     return ratios
+
+
+def density_from_points(center: Point, tree_info, radius: float, sigma: float):
+    if tree_info is None:
+        return 0.0, 0
+    buffer_geom = center.buffer(radius)
+    density = 0.0
+    count = 0
+    candidates = tree_info["tree"].query(buffer_geom)
+    for candidate in candidates:
+        geom = tree_geometry_from_candidate(tree_info, candidate)
+        if geom is None:
+            continue
+        dist = center.distance(geom)
+        if dist > radius:
+            continue
+        weight = tree_info.get("weights", {}).get(id(geom), 1.0)
+        density += weight * math.exp(-max(dist, 1.0) / sigma)
+        count += 1
+    return density, count
 
 
 def pct_change(current: float, baseline: float):
@@ -914,6 +1079,29 @@ def enrich_graph_with_environment(graph: nx.MultiDiGraph):
         data["bad_area_score"] = float(bad_area)
 
 
+def apply_bike_safety_layers(graph: nx.MultiDiGraph):
+    """Attach bike crash and traffic risk layers to a graph."""
+    projected = ox.project_graph(graph)
+    target_crs = projected.graph.get("crs")
+    crash_points = load_or_mock_points(BIKE_CRASH_DATA_PATH, projected, target_crs, mock_count=220)
+    traffic_points = load_or_mock_points(TRAFFIC_DATA_PATH, projected, target_crs, mock_count=180)
+
+    for u, v, k, data_proj in projected.edges(keys=True, data=True):
+        geom = data_proj.get("geometry")
+        if geom is None or geom.is_empty:
+            geom = build_linestring(projected, u, v)
+        center = geom.interpolate(0.5, normalized=True)
+
+        crash_density, _ = density_from_points(center, crash_points, BIKE_CRASH_INFLUENCE_RADIUS, BIKE_CRASH_SIGMA)
+        traffic_density, _ = density_from_points(center, traffic_points, BIKE_CRASH_INFLUENCE_RADIUS, TRAFFIC_SIGMA)
+        risk_score = min(1.0, 0.7 * crash_density + 0.6 * traffic_density)
+
+        data = graph[u][v][k]
+        data["bike_crash_risk"] = float(min(1.0, crash_density))
+        data["traffic_risk"] = float(min(1.0, traffic_density))
+        data["bike_risk_score"] = float(risk_score)
+
+
 def graph_has_environmental_data(graph: nx.MultiDiGraph) -> bool:
     for _, _, data in graph.edges(data=True):
         if not all(key in data for key in REQUIRED_EDGE_KEYS):
@@ -970,34 +1158,23 @@ def get_nearest_nodes(
         )
 
 
-@app.on_event("startup")
-def load_graph():
-    global G_walk
+def prepare_graph(graph: nx.MultiDiGraph, cache_path: Path, is_bike: bool = False):
+    graph = ox.distance.add_edge_lengths(graph)
 
-    if CACHE_PATH.exists():
-        print(f"Loading walking graph from cache: {CACHE_PATH}")
-        G_walk = ox.load_graphml(CACHE_PATH)
-    else:
-        print("Down  walking graph for Munich...")
-        G_walk = ox.graph_from_place("Munich, Germany", network_type="walk", simplify=True)
-        ox.save_graphml(G_walk, CACHE_PATH)
-        print(f"Graph cached at {CACHE_PATH}")
-
-    G_walk = ox.distance.add_edge_lengths(G_walk)
-
-    if graph_has_environmental_data(G_walk):
+    if graph_has_environmental_data(graph):
         print("Refreshing scenic scores from cached environmental data...")
-        for _, _, _, data in G_walk.edges(keys=True, data=True):
+        for _, _, _, data in graph.edges(keys=True, data=True):
             data["scenic_score"] = compute_scenic_score(data)
+            data["safe_score"] = compute_safety_score(data)
     else:
         print("Computing environmental context (green/water) ...")
         try:
-            enrich_graph_with_environment(G_walk)
-            ox.save_graphml(G_walk, CACHE_PATH)
-            print("Updated graph cache with scenic context.")
+            enrich_graph_with_environment(graph)
+            ox.save_graphml(graph, cache_path)
+            print(f"Updated graph cache with scenic context for {cache_path.name}.")
         except Exception as exc:
             print(f"Warning: scenic enrichment failed, falling back to heuristics ({exc})")
-            for _, _, _, data in G_walk.edges(keys=True, data=True):
+            for _, _, _, data in graph.edges(keys=True, data=True):
                 data.setdefault("dist_green", DEFAULT_DIST)
                 data.setdefault("dist_water", DEFAULT_DIST)
                 data.setdefault("dist_safe_poi", DEFAULT_DIST)
@@ -1010,16 +1187,54 @@ def load_graph():
                 data["scenic_score"] = compute_scenic_score(data)
                 data["safe_score"] = compute_safety_score(data)
 
-    print("Graph ready.")
-    # rebuild nearest-node cache for fallback lookups
+    if is_bike:
+        print("Applying bike crash and traffic safety layers...")
+        try:
+            apply_bike_safety_layers(graph)
+            ox.save_graphml(graph, cache_path)
+        except Exception as exc:
+            print(f"Warning: bike safety layer enrichment failed: {exc}")
+
+    return graph
+
+
+def load_or_download_graph(cache_path: Path, network_type: str):
+    if cache_path.exists():
+        print(f"Loading {network_type} graph from cache: {cache_path}")
+        return ox.load_graphml(cache_path)
+    print(f"Downloading {network_type} graph for Munich...")
+    graph = ox.graph_from_place("Munich, Germany", network_type=network_type, simplify=True)
+    ox.save_graphml(graph, cache_path)
+    print(f"Graph cached at {cache_path}")
+    return graph
+
+
+@app.on_event("startup")
+def load_graphs():
+    global G_walk, G_bike
+
+    G_walk = load_or_download_graph(CACHE_PATH, "walk")
+    G_walk = prepare_graph(G_walk, CACHE_PATH, is_bike=False)
+
+    try:
+        G_bike = load_or_download_graph(CACHE_PATH_BIKE, "bike")
+        G_bike = prepare_graph(G_bike, CACHE_PATH_BIKE, is_bike=True)
+    except Exception as exc:
+        print(f"Warning: failed to load bike graph, falling back to walking graph ({exc})")
+        G_bike = G_walk
+
+    print("Graphs ready.")
     NODE_CACHE.clear()
     NODE_CACHE[id(G_walk)] = build_node_cache(G_walk)
+    NODE_CACHE[id(G_bike)] = build_node_cache(G_bike)
 
 
 def get_graph_for_mode(mode: str):
-    if mode in MODE_CONFIG:
-        return G_walk
-    raise ValueError(f"Unknown mode: {mode}")
+    if mode not in MODE_CONFIG:
+        raise ValueError(f"Unknown mode: {mode}")
+    if mode.startswith("bike_"):
+        return G_bike
+    return G_walk
 
 
 @app.get("/health")
@@ -1044,11 +1259,19 @@ def route(
     start_lon: float,
     end_lat: float,
     end_lon: float,
+    transport: str = "walk",
 ):
-    global G_walk
+    global G_walk, G_bike
+
+    transport = (transport or "walk").lower()
+    if transport not in {"walk", "bike"}:
+        raise HTTPException(status_code=400, detail=f"Unsupported transport: {transport}")
+
+    base_mode = mode
+    mode_key = f"bike_{base_mode}" if transport == "bike" else base_mode
 
     try:
-        G = get_graph_for_mode(mode)
+        G = get_graph_for_mode(mode_key)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -1062,39 +1285,46 @@ def route(
         raise HTTPException(status_code=400, detail=f"Could not find nearest nodes: {exc}")
 
     try:
-        result = compute_route_variant(G, start_node, end_node, mode)
+        result = compute_route_variant(G, start_node, end_node, mode_key)
     except nx.NetworkXNoPath:
         raise HTTPException(status_code=404, detail="No path found")
 
     def try_variant(name: str):
+        variant_key = f"bike_{name}" if transport == "bike" else name
         try:
-            return compute_route_variant(G, start_node, end_node, name)
+            return compute_route_variant(G, start_node, end_node, variant_key)
         except nx.NetworkXNoPath:
             return None
 
     # always compute direct baseline for comparisons when possible
-    baseline_result = try_variant("fast") if mode != "fast" else result
-    safe_result = try_variant("safe") if mode != "safe" else result
-    scenic_result = try_variant("scenic") if mode != "scenic" else result
+    baseline_result = try_variant("fast") if base_mode != "fast" else result
+    safe_result = try_variant("safe") if base_mode != "safe" else result
+    scenic_result = try_variant("scenic") if base_mode != "scenic" else result
 
     comparison_info = None
-    if mode != "fast" and baseline_result is not None:
+    if base_mode != "fast" and baseline_result is not None:
         ratios = compute_comparison_ratios(result["stats"], baseline_result["stats"])
+        baseline_label = MODE_DISPLAY_NAME.get(
+            "bike_fast" if transport == "bike" else "fast",
+            MODE_DISPLAY_NAME.get("fast", "Fast"),
+        )
         comparison_info = {
             "baseline_mode": "fast",
-            "baseline_label": MODE_DISPLAY_NAME.get("fast", "Fast"),
+            "baseline_label": baseline_label,
             "ratios": ratios,
         }
 
     properties = {
-        "mode": mode,
-        "mode_label": MODE_DISPLAY_NAME.get(mode, mode.title()),
+        "mode": base_mode,
+        "mode_key": mode_key,
+        "transport": transport,
+        "mode_label": MODE_DISPLAY_NAME.get(mode_key, MODE_DISPLAY_NAME.get(base_mode, base_mode.title())),
         "length_m": result["length_m"],
         "duration_s": result["duration_s"],
         "stats": result["stats"],
     }
 
-    if mode != "fast" and baseline_result is not None:
+    if base_mode != "fast" and baseline_result is not None:
         properties["baseline_stats"] = baseline_result["stats"]
         properties["comparison_to_fast"] = comparison_info
 

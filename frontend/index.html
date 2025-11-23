@@ -15,6 +15,8 @@
             --fast-shadow: rgba(107, 114, 128, 0.24);
             --safe-shadow: rgba(11, 75, 124, 0.24);
             --scenic-shadow: rgba(15, 109, 44, 0.20);
+            --accent-walk: #d7a43b;
+            --accent-bike: #0b4b7c;
         }
 
         * {
@@ -48,6 +50,87 @@
             display: flex;
             flex-direction: column;
             gap: 14px;
+            transition: box-shadow 0.25s ease, border-color 0.25s ease;
+            border: 1px solid rgba(15, 23, 42, 0.08);
+        }
+
+        .transport-toggle {
+            position: relative;
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            align-items: center;
+            background: linear-gradient(135deg, #0f172a, #111827);
+            border-radius: 999px;
+            padding: 4px;
+            gap: 6px;
+        }
+
+        .transport-toggle button {
+            border: none;
+            background: transparent;
+            border-radius: 999px;
+            padding: 8px 10px;
+            font-size: 12px;
+            font-weight: 600;
+            color: #e2e8f0;
+            cursor: pointer;
+            transition: color 0.2s ease;
+            position: relative;
+            z-index: 1;
+        }
+
+        .transport-toggle .toggle-slider {
+            position: absolute;
+            top: 4px;
+            bottom: 4px;
+            left: 4px;
+            width: calc(50% - 6px);
+            border-radius: 999px;
+            background: #0b4b7c;
+            box-shadow: 0 10px 24px rgba(0, 0, 0, 0.35);
+            transition: transform 0.25s ease, background 0.25s ease, box-shadow 0.25s ease;
+        }
+
+        .transport-toggle.walk .toggle-slider {
+            transform: translateX(0) scale(1.02);
+            background: var(--accent-walk);
+            box-shadow: 0 10px 22px rgba(15, 109, 44, 0.22);
+        }
+
+        .transport-toggle.bike .toggle-slider {
+            transform: translateX(100%) scale(1.02);
+            background: var(--accent-bike);
+            box-shadow: 0 10px 22px rgba(11, 75, 124, 0.22);
+        }
+
+        .transport-toggle.walk button[data-transport="walk"],
+        .transport-toggle.bike button[data-transport="bike"] {
+            color: #0f172a;
+            font-weight: 700;
+        }
+
+        body.bike-mode {
+            background: linear-gradient(135deg, #0a1f33 0%, #0c3b6a 45%, #0f6d2c 100%);
+        }
+
+        body.walk-mode .controls {
+            box-shadow: 0 30px 45px rgba(15, 109, 44, 0.22);
+            border-color: rgba(15, 109, 44, 0.24);
+        }
+
+        body.bike-mode .controls {
+            box-shadow: 0 30px 45px rgba(11, 75, 124, 0.24);
+            border-color: rgba(11, 75, 124, 0.2);
+        }
+
+        body.bike-mode .stats-card {
+            border-color: rgba(11, 75, 124, 0.2);
+            box-shadow: 0 14px 24px rgba(11, 75, 124, 0.12);
+        }
+
+        body.walk-mode .stats-card {
+            border-color: rgba(15, 109, 44, 0.2);
+            box-shadow: 0 14px 24px rgba(15, 109, 44, 0.12);
         }
 
         .controls h1 {
@@ -238,7 +321,11 @@
 
 <body>
     <div class="controls">
-        <h1>Choose your vibe</h1>
+        <div class="transport-toggle walk" id="transport-toggle">
+            <div class="toggle-slider"></div>
+            <button type="button" data-transport="walk" aria-label="Walking mode">Walk</button>
+            <button type="button" data-transport="bike" aria-label="Biking mode">Bike</button>
+        </div>
         <div id="mode-buttons" class="mode-buttons"></div>
         <div class="hint">Click once for start, once for end. A third click resets.</div>
         <div class="stats-card" id="stats-card">
@@ -252,7 +339,7 @@
                     <div class="stat-value" id="stat-duration">--</div>
                 </div>
                 <div class="stat-item">
-                    <div class="stat-label">Steps</div>
+                    <div class="stat-label" id="stat-steps-label">Steps</div>
                     <div class="stat-value" id="stat-steps">--</div>
                     <div class="stat-note" id="stat-kcal">≈ -- kcal burned</div>
                 </div>
@@ -274,9 +361,11 @@
         const backendUrl = "http://localhost:8000";
         const STEP_LENGTH_M = 0.78; // average adult step length in meters
         const KCAL_PER_STEP = 0.05; // approximate kcal burned per step for a casual walk
+        const BIKE_KCAL_PER_KM = 24; // moderate cycling kcal per km
+        const BIKE_WH_PER_KM = 18; // rough watt-hour effort per km
         const CAR_CO2_KG_PER_KM = 0.192; // average passenger car emissions per km
         const PHONE_CHARGE_CO2_KG = 0.2; // approx CO2 per full smartphone charge, rounded for simpler integers
-        const MODE_OPTIONS = [
+        const MODE_OPTIONS_WALK = [
             {
                 id: "fast",
                 label: "Direct",
@@ -291,6 +380,23 @@
                 id: "scenic",
                 label: "Scenic",
                 description: "Seeks river walks, parks and tree-lined alleys for the most pleasant detour.",
+            },
+        ];
+        const MODE_OPTIONS_BIKE = [
+            {
+                id: "fast",
+                label: "Bike Direct",
+                description: "Stay quick on cycle lanes and bikeable streets.",
+            },
+            {
+                id: "safe",
+                label: "Ride Safe",
+                description: "Avoid crash hotspots and heavy traffic for a calmer ride.",
+            },
+            {
+                id: "scenic",
+                label: "Bike Scenic",
+                description: "Thread through green corridors on bike-friendly paths.",
             },
         ];
         const MODE_COLORS = {
@@ -316,39 +422,58 @@
         let endMarker = null;
         let routeLayer = null;
         let currentMode = "safe";
+        let currentTransport = "walk";
+        let currentModeOptions = MODE_OPTIONS_WALK;
         const modeButtonsContainer = document.getElementById("mode-buttons");
+        const transportToggle = document.getElementById("transport-toggle");
         const statDistance = document.getElementById("stat-distance");
         const statDuration = document.getElementById("stat-duration");
         const statSteps = document.getElementById("stat-steps");
         const statKcal = document.getElementById("stat-kcal");
         const statCo2 = document.getElementById("stat-co2");
         const statCo2Eq = document.getElementById("stat-co2-eq");
+        const statStepsLabel = document.getElementById("stat-steps-label");
         const comparisonList = document.getElementById("comparison-list");
         resetStats();
-
-        MODE_OPTIONS.forEach(opt => {
-            const card = document.createElement("div");
-            card.className = "mode-card";
-            card.dataset.mode = opt.id;
-
-            const chip = document.createElement("button");
-            chip.type = "button";
-            chip.className = "mode-chip";
-            chip.textContent = opt.label;
-            chip.addEventListener("click", (event) => {
-                event.stopPropagation();
-                setMode(opt.id);
-            });
-
-            const desc = document.createElement("p");
-            desc.textContent = opt.description;
-
-            card.appendChild(chip);
-            card.appendChild(desc);
-            card.addEventListener("click", () => setMode(opt.id));
-            modeButtonsContainer.appendChild(card);
-        });
+        renderModeButtons();
         updateModeButtons();
+        updateTransportUI();
+        updateStatLabels();
+
+        transportToggle.querySelectorAll("button").forEach(btn => {
+            btn.addEventListener("click", () => {
+                const target = btn.dataset.transport;
+                if (target && target !== currentTransport) {
+                    setTransport(target);
+                }
+            });
+        });
+
+        function renderModeButtons() {
+            modeButtonsContainer.innerHTML = "";
+            currentModeOptions.forEach(opt => {
+                const card = document.createElement("div");
+                card.className = "mode-card";
+                card.dataset.mode = opt.id;
+
+                const chip = document.createElement("button");
+                chip.type = "button";
+                chip.className = "mode-chip";
+                chip.textContent = opt.label;
+                chip.addEventListener("click", (event) => {
+                    event.stopPropagation();
+                    setMode(opt.id);
+                });
+
+                const desc = document.createElement("p");
+                desc.textContent = opt.description;
+
+                card.appendChild(chip);
+                card.appendChild(desc);
+                card.addEventListener("click", () => setMode(opt.id));
+                modeButtonsContainer.appendChild(card);
+            });
+        }
 
         function setMode(mode) {
             currentMode = mode;
@@ -366,6 +491,39 @@
                     card.classList.remove("active");
                 }
             });
+        }
+
+        function setTransport(transport) {
+            currentTransport = transport;
+            currentModeOptions = transport === "bike" ? MODE_OPTIONS_BIKE : MODE_OPTIONS_WALK;
+            renderModeButtons();
+            updateModeButtons();
+            updateTransportUI();
+            updateStatLabels();
+            resetStats();
+            if (startMarker && endMarker) {
+                fetchRoute();
+            }
+        }
+
+        function updateTransportUI() {
+            const isBike = currentTransport === "bike";
+            document.body.classList.toggle("bike-mode", isBike);
+            document.body.classList.toggle("walk-mode", !isBike);
+            transportToggle.classList.toggle("bike", isBike);
+            transportToggle.classList.toggle("walk", !isBike);
+        }
+
+        function updateStatLabels() {
+            if (currentTransport === "bike") {
+                statStepsLabel.textContent = "Calories";
+                statSteps.textContent = "--";
+                statKcal.textContent = "≈ -- Wh effort";
+            } else {
+                statStepsLabel.textContent = "Steps";
+                statSteps.textContent = "--";
+                statKcal.textContent = "≈ -- kcal burned";
+            }
         }
 
         map.on("click", (e) => {
@@ -388,7 +546,7 @@
             const start = startMarker.getLatLng();
             const end = endMarker.getLatLng();
 
-            const url = `${backendUrl}/route?mode=${currentMode}` +
+            const url = `${backendUrl}/route?mode=${currentMode}&transport=${currentTransport}` +
                 `&start_lat=${start.lat}&start_lon=${start.lng}` +
                 `&end_lat=${end.lat}&end_lon=${end.lng}`;
 
@@ -434,8 +592,13 @@
             const derived = computeDerivedImpacts(lengthValue);
             statDistance.textContent = formatDistance(lengthValue);
             statDuration.textContent = formatDuration(durationValue);
-            statSteps.textContent = formatSteps(derived.steps);
-            statKcal.textContent = formatCalories(derived.kcal);
+            if (currentTransport === "bike") {
+                statSteps.textContent = formatCaloriesValue(derived.bikeKcal);
+                statKcal.textContent = formatWh(derived.bikeWh);
+            } else {
+                statSteps.textContent = formatSteps(derived.steps);
+                statKcal.textContent = formatCalories(derived.kcal);
+            }
             statCo2.textContent = formatCo2(derived.savedCo2Kg);
             statCo2Eq.textContent = formatTangibleEquivalent(derived.savedCo2Kg);
             renderComparison(props.comparison_to_fast, props.comparison_custom);
@@ -516,6 +679,17 @@
             return Math.round(steps).toLocaleString("en-US");
         }
 
+        function formatCaloriesValue(kcal) {
+            if (!kcal) return "0";
+            return Math.round(kcal).toLocaleString("en-US");
+        }
+
+        function formatWh(wh) {
+            if (!wh) return "≈ 0 Wh";
+            if (wh < 1) return "≈ <1 Wh";
+            return `≈ ${Math.round(wh).toLocaleString("en-US")} Wh`;
+        }
+
         function formatCalories(kcal) {
             if (!kcal || kcal < 1) return "≈ <1 kcal burned";
             return `≈ ${Math.round(kcal).toLocaleString("en-US")} kcal burned`;
@@ -544,21 +718,22 @@
 
         function computeDerivedImpacts(lengthMeters) {
             const distanceKm = (lengthMeters || 0) / 1000;
+            const savedCo2Kg = distanceKm * CAR_CO2_KG_PER_KM;
+            if (currentTransport === "bike") {
+                const bikeKcal = distanceKm * BIKE_KCAL_PER_KM;
+                const bikeWh = distanceKm * BIKE_WH_PER_KM;
+                return { bikeKcal, bikeWh, savedCo2Kg };
+            }
             const steps = lengthMeters > 0 ? lengthMeters / STEP_LENGTH_M : 0;
             const kcal = steps * KCAL_PER_STEP;
-            const savedCo2Kg = distanceKm * CAR_CO2_KG_PER_KM;
-            return {
-                steps,
-                kcal,
-                savedCo2Kg,
-            };
+            return { steps, kcal, savedCo2Kg };
         }
 
         function resetStats() {
             statDistance.textContent = "--";
             statDuration.textContent = "--";
             statSteps.textContent = "--";
-            statKcal.textContent = "≈ -- kcal burned";
+            statKcal.textContent = currentTransport === "bike" ? "≈ -- Wh effort" : "≈ -- kcal burned";
             statCo2.textContent = "--";
             statCo2Eq.textContent = "≈ tangible savings";
             comparisonList.innerHTML = '<span class="comparison-pill neutral">Pick two points to compare modes</span>';
